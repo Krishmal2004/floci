@@ -341,9 +341,32 @@ public class LambdaMicrovmsService {
         public String stateReason;
         public Instant startedAt;
         public Instant terminatedAt;
+        public String executionRoleArn;
+        public List<String> ingressNetworkConnectors;
+        public List<String> egressNetworkConnectors;
+        public Integer maximumDurationInSeconds;
+        public IdlePolicy idlePolicy;
+    }
+
+    @RegisterForReflection
+    public static final class IdlePolicy {
+        public Boolean autoResumeEnabled;
+        public Integer maxIdleDurationSeconds;
+        public Integer suspendedDurationSeconds;
+    }
+
+    /** The optional run settings of RunMicrovm; a null member keeps the default. */
+    public record RunSettings(String executionRoleArn, List<String> ingressNetworkConnectors,
+                              List<String> egressNetworkConnectors, Integer maximumDurationInSeconds,
+                              IdlePolicy idlePolicy, String imageVersion) {
+        public static final RunSettings NONE = new RunSettings(null, null, null, null, null, null);
     }
 
     public Microvm runMicrovm(String region, String accountId, String imageIdentifier) {
+        return runMicrovm(region, accountId, imageIdentifier, RunSettings.NONE);
+    }
+
+    public Microvm runMicrovm(String region, String accountId, String imageIdentifier, RunSettings settings) {
         if (imageIdentifier == null || imageIdentifier.isBlank()) {
             throw new AwsException("ValidationException", "imageIdentifier is required", 400);
         }
@@ -355,9 +378,24 @@ public class LambdaMicrovmsService {
         Microvm vm = new Microvm();
         vm.microvmId = "microvm-" + UUID.randomUUID();
         vm.imageArn = image.imageArn;
-        vm.imageVersion = image.latestActiveImageVersion;
+        if (settings.imageVersion() == null) {
+            vm.imageVersion = image.latestActiveImageVersion;
+        } else {
+            vm.imageVersion = image.versions.stream()
+                    .map(v -> v.imageVersion)
+                    .filter(settings.imageVersion()::equals)
+                    .findFirst()
+                    .orElseThrow(() -> new AwsException("ResourceNotFoundException",
+                            "MicroVM image version not found: " + imageIdentifier + "/" + settings.imageVersion(),
+                            404));
+        }
         vm.endpoint = UUID.randomUUID() + ".lambda-microvm." + region + ".on.aws";
         vm.startedAt = Instant.now();
+        vm.executionRoleArn = settings.executionRoleArn();
+        vm.ingressNetworkConnectors = settings.ingressNetworkConnectors();
+        vm.egressNetworkConnectors = settings.egressNetworkConnectors();
+        vm.maximumDurationInSeconds = settings.maximumDurationInSeconds();
+        vm.idlePolicy = settings.idlePolicy();
         // Settle instantly: the response carries PENDING, the next read RUNNING.
         vm.state = "RUNNING";
         microvms.put(key(region, vm.microvmId), vm);
@@ -368,6 +406,11 @@ public class LambdaMicrovmsService {
         response.imageVersion = vm.imageVersion;
         response.endpoint = vm.endpoint;
         response.startedAt = vm.startedAt;
+        response.executionRoleArn = vm.executionRoleArn;
+        response.ingressNetworkConnectors = vm.ingressNetworkConnectors;
+        response.egressNetworkConnectors = vm.egressNetworkConnectors;
+        response.maximumDurationInSeconds = vm.maximumDurationInSeconds;
+        response.idlePolicy = vm.idlePolicy;
         return response;
     }
 

@@ -8,10 +8,12 @@ import io.github.hectorvent.floci.core.common.AwsArnUtils;
 import io.github.hectorvent.floci.core.common.AwsException;
 import io.github.hectorvent.floci.core.common.EpochSeconds;
 import io.github.hectorvent.floci.core.common.RegionResolver;
+import io.github.hectorvent.floci.services.lambdamicrovms.LambdaMicrovmsService.IdlePolicy;
 import io.github.hectorvent.floci.services.lambdamicrovms.LambdaMicrovmsService.Microvm;
 import io.github.hectorvent.floci.services.lambdamicrovms.LambdaMicrovmsService.MicrovmBuild;
 import io.github.hectorvent.floci.services.lambdamicrovms.LambdaMicrovmsService.MicrovmImage;
 import io.github.hectorvent.floci.services.lambdamicrovms.LambdaMicrovmsService.MicrovmImageVersion;
+import io.github.hectorvent.floci.services.lambdamicrovms.LambdaMicrovmsService.RunSettings;
 import jakarta.inject.Inject;
 import jakarta.ws.rs.Consumes;
 import jakarta.ws.rs.DELETE;
@@ -27,6 +29,8 @@ import jakarta.ws.rs.core.HttpHeaders;
 import jakarta.ws.rs.core.MediaType;
 import jakarta.ws.rs.core.Response;
 
+import java.util.ArrayList;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 
@@ -98,6 +102,12 @@ public class LambdaMicrovmsController {
                 text(request, "buildRoleArn"),
                 codeArtifact.isMissingNode() ? null : text(codeArtifact, "uri"),
                 text(request, "description"));
+        JsonNode tags = request.path("tags");
+        if (tags.isObject() && !tags.isEmpty()) {
+            Map<String, String> requested = new LinkedHashMap<>();
+            tags.fields().forEachRemaining(entry -> requested.put(entry.getKey(), entry.getValue().asText()));
+            service.tagResource(region, image.imageArn, requested);
+        }
         return Response.status(201).entity(imageNode(image, ImageShape.CREATE)).build();
     }
 
@@ -271,7 +281,7 @@ public class LambdaMicrovmsController {
         String region = regionResolver.resolveRegion(headers);
         JsonNode request = parse(body);
         Microvm vm = service.runMicrovm(region, regionResolver.getAccountId(),
-                text(request, "imageIdentifier"));
+                text(request, "imageIdentifier"), runSettings(request));
         return Response.ok(vmNode(vm)).build();
     }
 
@@ -493,14 +503,40 @@ public class LambdaMicrovmsController {
         node.put("imageArn", vm.imageArn);
         node.put("imageVersion", vm.imageVersion);
         node.put("endpoint", vm.endpoint);
-        node.put("maximumDurationInSeconds", 28800);
+        node.put("maximumDurationInSeconds",
+                vm.maximumDurationInSeconds == null ? 28800 : vm.maximumDurationInSeconds);
         String region = regionOf(vm.imageArn);
-        node.putArray("egressNetworkConnectors")
-                .add(AwsArnUtils.Arn.of("lambda", region, "aws", "network-connector:aws-network-connector:INTERNET_EGRESS").toString());
-        node.putArray("ingressNetworkConnectors")
-                .add(AwsArnUtils.Arn.of("lambda", region, "aws", "network-connector:aws-network-connector:HTTP_INGRESS").toString());
-        node.putNull("executionRoleArn");
-        node.putNull("idlePolicy");
+        ArrayNode egress = node.putArray("egressNetworkConnectors");
+        if (vm.egressNetworkConnectors == null) {
+            egress.add(AwsArnUtils.Arn.of("lambda", region, "aws", "network-connector:aws-network-connector:INTERNET_EGRESS").toString());
+        } else {
+            vm.egressNetworkConnectors.forEach(egress::add);
+        }
+        ArrayNode ingress = node.putArray("ingressNetworkConnectors");
+        if (vm.ingressNetworkConnectors == null) {
+            ingress.add(AwsArnUtils.Arn.of("lambda", region, "aws", "network-connector:aws-network-connector:HTTP_INGRESS").toString());
+        } else {
+            vm.ingressNetworkConnectors.forEach(ingress::add);
+        }
+        if (vm.executionRoleArn == null) {
+            node.putNull("executionRoleArn");
+        } else {
+            node.put("executionRoleArn", vm.executionRoleArn);
+        }
+        if (vm.idlePolicy == null) {
+            node.putNull("idlePolicy");
+        } else {
+            ObjectNode idle = node.putObject("idlePolicy");
+            if (vm.idlePolicy.autoResumeEnabled != null) {
+                idle.put("autoResumeEnabled", vm.idlePolicy.autoResumeEnabled);
+            }
+            if (vm.idlePolicy.maxIdleDurationSeconds != null) {
+                idle.put("maxIdleDurationSeconds", vm.idlePolicy.maxIdleDurationSeconds);
+            }
+            if (vm.idlePolicy.suspendedDurationSeconds != null) {
+                idle.put("suspendedDurationSeconds", vm.idlePolicy.suspendedDurationSeconds);
+            }
+        }
         node.putNull("terminationReasonCode");
         if (vm.stateReason == null) {
             node.putNull("stateReason");
@@ -514,6 +550,36 @@ public class LambdaMicrovmsController {
             node.put("terminatedAt", EpochSeconds.fromInstant(vm.terminatedAt));
         }
         return node;
+    }
+
+    private RunSettings runSettings(JsonNode request) {
+        IdlePolicy idlePolicy = null;
+        JsonNode idle = request.get("idlePolicy");
+        if (idle != null && idle.isObject()) {
+            idlePolicy = new IdlePolicy();
+            idlePolicy.autoResumeEnabled = idle.hasNonNull("autoResumeEnabled")
+                    ? idle.get("autoResumeEnabled").asBoolean() : null;
+            idlePolicy.maxIdleDurationSeconds = idle.hasNonNull("maxIdleDurationSeconds")
+                    ? idle.get("maxIdleDurationSeconds").asInt() : null;
+            idlePolicy.suspendedDurationSeconds = idle.hasNonNull("suspendedDurationSeconds")
+                    ? idle.get("suspendedDurationSeconds").asInt() : null;
+        }
+        return new RunSettings(text(request, "executionRoleArn"),
+                stringList(request, "ingressNetworkConnectors"),
+                stringList(request, "egressNetworkConnectors"),
+                request.hasNonNull("maximumDurationInSeconds")
+                        ? request.get("maximumDurationInSeconds").asInt() : null,
+                idlePolicy, text(request, "imageVersion"));
+    }
+
+    private List<String> stringList(JsonNode node, String field) {
+        JsonNode value = node.get(field);
+        if (value == null || !value.isArray()) {
+            return null;
+        }
+        List<String> items = new ArrayList<>();
+        value.forEach(item -> items.add(item.asText()));
+        return items;
     }
 
     private ObjectNode catalogNode(List<Map<String, Object>> entries) {

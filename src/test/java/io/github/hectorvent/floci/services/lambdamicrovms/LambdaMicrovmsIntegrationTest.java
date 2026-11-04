@@ -570,4 +570,144 @@ class LambdaMicrovmsIntegrationTest {
                 .then().statusCode(404)
                 .body("message", equalTo("Network connector not found: " + arn));
     }
+
+    @Test
+    @Order(101)
+    void runMicrovmRunsTheRequestedImageVersion() {
+        String name = "microvm-two-version-image";
+        String image = """
+                {
+                  "name": "%s",
+                  "baseImageArn": "arn:aws:lambda:us-east-1:aws:microvm-image:al2023-1",
+                  "buildRoleArn": "arn:aws:iam::000000000000:role/microvm-build",
+                  "codeArtifact": { "uri": "s3://bucket/code.zip" }
+                }
+                """.formatted(name);
+        given().contentType("application/json").body(image)
+                .when().post(MICROVMS + "/microvm-images")
+                .then().statusCode(201);
+        given().contentType("application/json").body(image)
+                .when().put(MICROVMS + "/microvm-images/" + name)
+                .then().statusCode(200);
+
+        String id = given().contentType("application/json")
+                .body("{\"imageIdentifier\": \"" + name + "\", \"imageVersion\": \"1.0\"}")
+                .when().post(MICROVMS + "/microvms")
+                .then().statusCode(200)
+                .body("imageVersion", equalTo("1.0"))
+                .extract().path("microvmId");
+        given().when().get(MICROVMS + "/microvms/" + id)
+                .then().statusCode(200)
+                .body("imageVersion", equalTo("1.0"));
+        given().when().get(MICROVMS + "/microvms")
+                .then().statusCode(200)
+                .body("items.find { it.microvmId == '" + id + "' }.imageVersion", equalTo("1.0"));
+
+        given().contentType("application/json")
+                .body("{\"imageIdentifier\": \"" + name + "\"}")
+                .when().post(MICROVMS + "/microvms")
+                .then().statusCode(200)
+                .body("imageVersion", equalTo("2.0"));
+
+        given().contentType("application/json")
+                .body("{\"imageIdentifier\": \"" + name + "\", \"imageVersion\": \"9.0\"}")
+                .when().post(MICROVMS + "/microvms")
+                .then().statusCode(404);
+    }
+
+    @Test
+    @Order(102)
+    void createMicrovmImageAppliesTags() {
+        String name = "microvm-create-tags-image";
+        String arn = given().contentType("application/json")
+                .body("""
+                        {
+                          "name": "%s",
+                          "baseImageArn": "arn:aws:lambda:us-east-1:aws:microvm-image:al2023-1",
+                          "buildRoleArn": "arn:aws:iam::000000000000:role/microvm-build",
+                          "codeArtifact": { "uri": "s3://bucket/code.zip" },
+                          "tags": { "team": "sandbox" }
+                        }
+                        """.formatted(name))
+                .when().post(MICROVMS + "/microvm-images")
+                .then().statusCode(201)
+                .body("tags", equalTo(null))
+                .extract().path("imageArn");
+        given().when().get(MICROVMS + "/microvm-images/" + name)
+                .then().statusCode(200)
+                .body("tags.team", equalTo("sandbox"));
+        given().when().get(TAGS + "/tags/" + arn)
+                .then().statusCode(200)
+                .body("Tags.team", equalTo("sandbox"));
+    }
+
+    @Test
+    @Order(100)
+    void runMicrovmKeepsRunSettings() {
+        String name = "microvm-run-settings-image";
+        given()
+                .contentType("application/json")
+                .body("""
+                        {
+                          "name": "%s",
+                          "baseImageArn": "arn:aws:lambda:us-east-1:aws:microvm-image:al2023-1",
+                          "buildRoleArn": "arn:aws:iam::000000000000:role/microvm-build",
+                          "codeArtifact": { "uri": "s3://bucket/code.zip" }
+                        }
+                        """.formatted(name))
+                .when()
+                .post(MICROVMS + "/microvm-images")
+                .then()
+                .statusCode(201);
+
+        String role = "arn:aws:iam::000000000000:role/microvm-runtime";
+        String ingress = "arn:aws:lambda:us-east-1:aws:network-connector:aws-network-connector:NO_INGRESS";
+        String egress = "arn:aws:lambda:us-east-1:000000000000:network-connector:nc-0123456789abcdef0";
+        String id = given()
+                .contentType("application/json")
+                .body("""
+                        {
+                          "imageIdentifier": "%s",
+                          "executionRoleArn": "%s",
+                          "ingressNetworkConnectors": ["%s"],
+                          "egressNetworkConnectors": ["%s"],
+                          "maximumDurationInSeconds": 3600,
+                          "idlePolicy": {"autoResumeEnabled": true, "maxIdleDurationSeconds": 900,
+                                         "suspendedDurationSeconds": 300}
+                        }
+                        """.formatted(name, role, ingress, egress))
+                .when()
+                .post(MICROVMS + "/microvms")
+                .then()
+                .statusCode(200)
+                .body("executionRoleArn", equalTo(role))
+                .body("ingressNetworkConnectors", contains(ingress))
+                .body("egressNetworkConnectors", contains(egress))
+                .body("maximumDurationInSeconds", equalTo(3600))
+                .body("idlePolicy.autoResumeEnabled", equalTo(true))
+                .body("idlePolicy.maxIdleDurationSeconds", equalTo(900))
+                .body("idlePolicy.suspendedDurationSeconds", equalTo(300))
+                .extract().path("microvmId");
+
+        given()
+                .when()
+                .get(MICROVMS + "/microvms/" + id)
+                .then()
+                .statusCode(200)
+                .body("state", equalTo("RUNNING"))
+                .body("executionRoleArn", equalTo(role))
+                .body("ingressNetworkConnectors", contains(ingress))
+                .body("egressNetworkConnectors", contains(egress))
+                .body("maximumDurationInSeconds", equalTo(3600))
+                .body("idlePolicy.autoResumeEnabled", equalTo(true))
+                .body("idlePolicy.maxIdleDurationSeconds", equalTo(900))
+                .body("idlePolicy.suspendedDurationSeconds", equalTo(300));
+
+        given()
+                .when()
+                .get(MICROVMS + "/microvms")
+                .then()
+                .statusCode(200)
+                .body("items.find { it.microvmId == '" + id + "' }", not(hasKey("idlePolicy")));
+    }
 }
